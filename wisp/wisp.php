@@ -188,11 +188,11 @@ function wisp_ConfigOptions()
             "Description" => "Assign dedicated ip to the server (optional)",
             "Type" => "yesno",
         ],
-        "nest_id" => [
-            "FriendlyName" => "Nest ID",
-            "Description" => "ID of the Nest for the server to use.",
+        "tags" => [
+            "FriendlyName" => "Node Tags",
+            "Description" => "Comma-separated node tag slugs to require in addition to the egg's own (e.g. \"premium\") for automatic node deployment. (optional)",
             "Type" => "text",
-            "Size" => 10,
+            "Size" => 25,
         ],
         "egg_id" => [
             "FriendlyName" => "Egg ID",
@@ -393,10 +393,9 @@ function wisp_CreateAccount(array $params)
         }
 
         // Get egg data
-        $nestId = wisp_GetOption($params, 'nest_id');
         $eggId = wisp_GetOption($params, 'egg_id');
 
-        $eggData = wisp_API($params, 'nests/' . $nestId . '/eggs/' . $eggId . '?include=variables');
+        $eggData = wisp_API($params, 'eggs/' . $eggId . '?include=variables');
         if ($eggData['status_code'] !== 200) throw new Exception('Failed to get egg data, received error code: ' . $eggData['status_code'] . '. Enable module debug log for more info.');
 
         $environment = [];
@@ -433,10 +432,10 @@ function wisp_CreateAccount(array $params)
         $backup_megabytes_limit = wisp_GetOption($params, 'backup_megabytes_limit');
         $backup_count_limit = wisp_GetOption($params, 'backup_count_limit');
         $server_template = wisp_GetOption($params, 'server_template_id');
+        $tags = wisp_GetOption($params, 'tags');
         $serverData = [
             'name' => $name,
             'user' => wisp_NormalizeId($userId),
-            'nest' => wisp_NormalizeId($nestId),
             'egg' => wisp_NormalizeId($eggId),
             'docker_image' => $image,
             'startup' => $startup,
@@ -464,72 +463,22 @@ function wisp_CreateAccount(array $params)
             'start_on_completion' => true,
             'external_id' => (string) $params['serviceid'],
         ];
-        if (isset($pack_id)) $serverData['pack'] = wisp_NormalizeId($pack_id);
+
+        // Additional node tags to require on top of the egg's own.
+        if (isset($tags) && $tags !== '') {
+            $serverData['deploy']['tags'] = array_values(array_filter(array_map('trim', explode(',', $tags)), 'strlen'));
+        }
+
+        // Forward the additional-port config to the panel, which resolves the
+        // primary + additional allocations (and binds the ports to the egg's
+        // variables) server-side.
+        if (isset($additional_ports) && $additional_ports !== '') {
+            $serverData['deploy']['additional_ports'] = wisp_TranslateAdditionalPorts($additional_ports);
+            $serverData['deploy']['additional_port_fail_mode'] = ($additional_port_fail_mode === 'stop') ? 'stop' : 'continue';
+        }
 
         // Link the provisioned server to a Wisp server template.
         if (isset($server_template) && $server_template !== '') $serverData['server_template'] = $server_template;
-
-        // Check if additional ports have been set
-        if (isset($additional_ports) && $additional_ports != '') {
-
-            // Query all nodes for the given location until we find an available set of ports
-            // Get the list of additional ports to add
-            //$additional_port_list = explode(",", $additional_ports);
-            $additional_port_list = $additional_ports;
-            // Get the server nodes for the specified location_id
-            $nodeResponse = wisp_API($params, "locations/$location_id/eligible-nodes?cpu=$cpu&memory=$memory&disk=$disk");
-            $nodes = $nodeResponse['data'];
-
-            // Get the port allocations for each node at this location and check if there's space for the additional ports
-            if (isset($nodes)) {
-                logModuleCall("WISP-WHMCS", "Got " . count($nodes) . " possibly eligible nodes for deployment", "", "");
-
-                $alloc_success = false;
-                foreach ($nodes as $node) {
-                    logModuleCall("WISP-WHMCS", "Checking allocations for node: {$node['id']} - {$node['name']}", "", "");
-
-                    // Get all the available allocations for this node
-                    $available_allocations = getAllocations($params, $node['id']);
-
-                    // Taking our additional allocation requirements and available node allocations, find a combination of available ports.
-                    $final_allocations = findFreePorts($available_allocations, $additional_port_list, $serverData['deploy']);
-
-                    if ($final_allocations != false && $final_allocations['status'] == true) {
-                        $alloc_success = true;
-                        logModuleCall("WISP-WHMCS", "Successfully found an allocation. Setting primary allocation to ID " . $final_allocations['main_allocation_id'], "", "");
-                        unset($serverData['deploy']);
-                        $serverData['allocation']['default'] = wisp_NormalizeId($final_allocations['main_allocation_id']);
-                        $serverData['allocation']['additional'] = $final_allocations['additional_allocation_ids'];
-
-                        // Update the environment parameters - additional allocations
-                        foreach ($final_allocations['additional_allocation_ports'] as $key => $port) {
-                            // If the key given in the config had a value of NONE, don't worry about adding it to the environment parameters.
-                            if (substr($key, 0, 4) !== "NONE") {
-                                $serverData['environment'][$key] = $port;
-                            }
-                        }
-                        // We successfully found and assigned an available allocation, break and check no more nodes.
-                        break;
-                    }
-                    logModuleCall("WISP-WHMCS", "Failed to find an available allocation on node: {$node['id']} - {$node['name']}", "", "");
-                }
-                if (!$alloc_success) {
-                    // Failure handling logic
-                    if ($additional_port_fail_mode == "stop") {
-                        throw new Exception('Couldn\'t find any nodes to satisfy the requested allocations.');
-                    } else {
-                        // Continue with normal deployment
-                        $serverData['deploy']['port_range'] = $port_range;
-                    }
-                }
-            } else {
-                logModuleCall("WISP-WHMCS", "Unable to find any nodes at location ID: " . $location_id, "", "");
-                throw new Exception('Couldn\'t find any nodes satisfying the request at location: ' . $location_id);
-            }
-        } else {
-            // Continue with normal deployment
-            $serverData['deploy']['port_range'] = $port_range;
-        }
 
         logModuleCall("WISP-WHMCS", "Create Account", print_r($serverData, true), "");
         logModuleCall("WISP-WHMCS", "Create Account", print_r($params, true), "");
@@ -675,10 +624,9 @@ function wisp_ChangePackage(array $params)
         //    the egg, and the template relink in step 2 only attaches when the
         //    server's egg already matches the template's -- so the egg must land
         //    before we relink.
-        $nestId = wisp_GetOption($params, 'nest_id');
         $eggId = wisp_GetOption($params, 'egg_id');
         $pack_id = wisp_GetOption($params, 'pack_id');
-        $eggData = wisp_API($params, 'nests/' . $nestId . '/eggs/' . $eggId . '?include=variables');
+        $eggData = wisp_API($params, 'eggs/' . $eggId . '?include=variables');
         if ($eggData['status_code'] !== 200) throw new Exception('Failed to get egg data, received error code: ' . $eggData['status_code'] . '. Enable module debug log for more info.');
 
         $environment = [];
@@ -801,160 +749,75 @@ function wisp_ClientArea(array $params)
 /* Utility Functions */
 
 /**
- * Gets the available allocations for a specific node_id
- * and returns them in a format that can be more easily parsed.
- * Output:
- * Returns the available allocations in
- * a more usable format for filtering
- * Format:
- * [
- *     [<ip_address>] => {
- *         [<port number>] => [
- *             ['id'] = 1234;
- *         ]
- *     },
- *     ['192.168.1.123'] => [
- *         ['1234'] => [
- *             ['id'] = 1234;
- *         ]
- *     ],
- * ]
+ * Translate the WHMCS `additional_ports` config into the panel's additional-port
+ * shape, so the panel resolves the primary + additional allocations server-side.
+ *
+ * The config is a JSON object keyed by offset-from-primary; each value is either a
+ * variable name ("RCON_PORT"), a variable with a custom range
+ * ("RCON_PORT:3000-3200" or "RCON_PORT:5000"), or "NONE"/"NONE:range" for a
+ * reserve-only port with no variable binding. A bare value becomes an `offset`
+ * entry keyed off that offset; a ":range" value becomes a `range` entry. This
+ * mirrors the panel's WhmcsProductMapper so import and provisioning agree.
+ *
+ * @return array<int, array<string, mixed>>
  */
-function getAllocations(array $params, $node_id)
+function wisp_TranslateAdditionalPorts($raw)
 {
-    $allocation_ids = array();
-
-    $allocations = getPaginatedData($params, 'nodes/' . $node_id . '/allocations/available');
-
-    foreach ($allocations as $key => $allocation) {
-        $ip = $allocation['attributes']['ip'];
-        $port = $allocation['attributes']['port'];
-
-        $allocation_ids[$ip][$port]['id'] = $allocation['attributes']['id'];
+    $decoded = json_decode($raw, true);
+    if (!is_array($decoded)) {
+        logModuleCall("WISP-WHMCS", "Invalid additional_ports JSON", $raw, "");
+        return [];
     }
 
-    return $allocation_ids;
+    $ports = array();
+    foreach ($decoded as $offset => $value) {
+        $parts = explode(':', (string) $value, 2);
+        $param = trim($parts[0]);
+        $spec = isset($parts[1]) ? trim($parts[1]) : '';
+        $variable = (strcasecmp($param, 'NONE') === 0 || $param === '') ? null : $param;
+
+        if ($spec !== '') {
+            $bounds = wisp_ParsePortRange($spec);
+            if ($bounds === null) {
+                logModuleCall("WISP-WHMCS", "Invalid additional port range", $spec, "");
+                continue;
+            }
+            $ports[] = ['variable' => $variable, 'type' => 'range', 'from' => $bounds[0], 'to' => $bounds[1]];
+        } else {
+            $ports[] = ['variable' => $variable, 'type' => 'offset', 'offset' => (int) $offset];
+        }
+    }
+
+    return $ports;
 }
 
-// Makes a paginated API request and returns the response.
-function getPaginatedData($params, $url)
+/**
+ * Parse a "FROM-TO" or single "PORT" spec into inclusive [from, to] bounds, or
+ * null when it isn't a valid 1-65535 range.
+ *
+ * @return array<int, int>|null
+ */
+function wisp_ParsePortRange($spec)
 {
-    $results = array();
-
-    // Fetch and parse first page of data
-    $response = wisp_API($params, $url);
-
-    foreach ($response['data'] as $key => $value) {
-        $results[] = $value;
+    if (strpos($spec, '-') !== false) {
+        $bits = explode('-', $spec, 2);
+        $low = (int) $bits[0];
+        $high = (int) $bits[1];
+    } elseif (is_numeric($spec)) {
+        $low = $high = (int) $spec;
+    } else {
+        return null;
     }
 
-    // Fetch and parse any remaining pages
-    $current_page = $response['meta']['pagination']['current_page'];
-    $total_pages = $response['meta']['pagination']['total_pages'];
-    while ($total_pages > $current_page) {
-        $next_page = intval($current_page) + 1;
-
-        $response = wisp_API($params, $url . '?page=' . $next_page);
-
-        foreach ($response['data'] as $key => $value) {
-            $results[] = $value;
-        }
-
-        $current_page = $response['meta']['pagination']['current_page'];
-        $total_pages = $response['meta']['pagination']['total_pages'];
+    if ($high < $low) {
+        $tmp = $low;
+        $low = $high;
+        $high = $tmp;
     }
-    return $results;
-}
 
-function findFreePorts(array $available_allocations, string $port_offsets, $deploy)
-{
-    /*
-        This is the main logic that takes a list of available allocations
-        and the required offsets and then finds the first available set.
-        e.g. if port offsets +1 +2 and +4 are requested (format: 1,2,4)
-        we take each port one by one and check if <port number> + 1,
-        <port number> + 2 and <port number> + 4 are available.
-        If all requested port allocations are available, they are returned.
-
-        Inputs:
-        $available_allocations      This is the first port in the range to test.
-                                    All other ports will be checked based on the
-                                    required offset from the first.
-
-        $port_offsets               The json string of offsets from the first port that
-                                    are required for the server.
-
-        Outputs:
-        $ports_found                The array of ports that were found available, based on the offsets
-                                    the additional ports required.
-    */
-
-    $port_offsets_array = json_decode($port_offsets, true);
-
-    // Iterate over available IP's
-    foreach ($available_allocations as $ip_addr => $ports) {
-        $result = array();
-        $result['status'] = false;
-        $main_allocation_id = "";
-        $main_allocation_port = "";
-        $additional_allocation_ids = array();
-        $additional_allocation_ports = array();
-        if (!empty($deploy["port_range"])) {
-            $deploy["port_range"] = json_encode($deploy["port_range"]);
-            //converts port_range string to object filled with int
-            $portrange = [];
-            array_push($portrange, intval(ltrim(strstr($deploy["port_range"], '-', true), '["')));
-            array_push($portrange, intval(ltrim(strstr($deploy["port_range"], '-'), '-')));
-
-            for ($i = $portrange[0] + 1; $i < $portrange[1]; $i++) {
-                array_push($portrange, $i);
-            }
-            //no need to sort but doing it to make it easier for possible future features
-            sort($portrange);
-            foreach ($ports as $port => $portDetails) {
-                json_decode($port);
-                if (!in_array($port, $portrange)) {
-                    unset($ports[$port]);
-                }
-            }
-        }
-        // Iterate over Ports
-        logModuleCall("WISP-WHMCS", "Checking IP: " . $ip_addr, "", "");
-        foreach ($ports as $port => $portDetails) {
-            $main_allocation_id = $portDetails['id'];
-            $main_allocation_port = $port;
-            $found_all = true;
-            foreach ($port_offsets_array as $port_offset => $environment) {
-                $next_port = intval($port) + intval($port_offset);
-                if (!isset($ports[$next_port])) {
-                    // Port is not available
-                    $found_all = false;
-                } else {
-                    // Port is available, add it to the array
-                    array_push($additional_allocation_ids, strval($ports[$next_port]['id']));
-                    //array_push($additional_allocation_ports, strval($next_port));
-
-                    $additional_allocation_ports[$environment] = $next_port;
-                }
-            }
-            if ($found_all == true) {
-                logModuleCall("WISP-WHMCS", "Found a game port allocation ID: " . $main_allocation_id, "", "");
-                logModuleCall("WISP-WHMCS", "Found additional allocation ID's: " . print_r($additional_allocation_ids, true), "", "");
-                logModuleCall("WISP-WHMCS", "Found additional allocation Ports: " . print_r($additional_allocation_ports, true), "", "");
-                $result['main_allocation_id'] = $main_allocation_id;
-                $result['main_allocation_port'] = $main_allocation_port;
-                $result['additional_allocation_ids'] = $additional_allocation_ids;
-                $result['additional_allocation_ports'] = $additional_allocation_ports;
-                $result['status'] = true;
-                return $result;
-            } else {
-                // Reset values in array for next run
-                $additional_allocation_ids = array();
-                $additional_allocation_ports = array();
-            }
-        }
+    if ($low < 1 || $high > 65535) {
+        return null;
     }
-    // Failed to find available set of ports based on requirements
-    logModuleCall("WISP-WHMCS", "Failed to find available ports!", "", "");
-    return false;
+
+    return [$low, $high];
 }
